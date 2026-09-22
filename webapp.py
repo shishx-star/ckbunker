@@ -2,7 +2,7 @@
 #
 # A web server.
 #
-import sys, os, asyncio, logging, aiohttp_jinja2, jinja2, time, weakref, re
+import sys, os, asyncio, collections, logging, aiohttp_jinja2, jinja2, time, weakref, re
 from aiohttp import web
 from yarl import URL
 from conn import Connection, MissingColdcard
@@ -196,12 +196,47 @@ def accept_user_login(ses):
     ses['ws_token'] = str(b32encode(os.urandom(15)), 'ascii')
     ses.pop('captcha', None)
 
+# Bounded per-IP login attempt limiter (sliding window).
+# - keyed on remote IP, NOT the session cookie: cookies are encrypted
+#   and client-rotatable, so an attacker could otherwise churn fresh
+#   cookies to dodge any per-session limit
+# - bounded dict so an attacker forging many source IPs cannot grow
+#   memory without bound (drops the least-recently-seen entry)
+_login_attempts = collections.OrderedDict()
+
+def check_login_rate(request):
+    # Return True if this IP may attempt login right now.
+    ip = request.remote or '?'
+    now = time.time()
+    window = settings.LOGIN_RATE_WINDOW
+
+    entry = _login_attempts.get(ip)
+    if entry is None:
+        entry = []
+        _login_attempts[ip] = entry
+    else:
+        # mark as most-recently-seen
+        _login_attempts.move_to_end(ip)
+        # drop attempts that fell out of the window
+        while entry and entry[0] < now - window:
+            entry.pop(0)
+
+    if len(entry) >= settings.MAX_LOGIN_ATTEMPTS:
+        return False
+
+    entry.append(now)
+
+    # enforce the memory bound by evicting the least-recently-seen IP
+    while len(_login_attempts) > settings.MAX_TRACKED_LOGIN_IPS:
+        _login_attempts.popitem(last=False)
+
+    return True
+
 @routes.post('/login')
 async def login_post(request):
 
     # they must have a current session already
     # - hope this is enough against CSRF
-    # - TODO: some rate limiting here, without DoS attacks
     ses = await get_session(request)
     form = await request.post()
     ok = False
@@ -222,6 +257,12 @@ async def login_post(request):
 
         if not captcha or not pw:
             # keep same captcha; they just pressed enter
+            ok = False
+
+        elif not check_login_rate(request):
+            # too many real guesses from this IP recently; ignore it
+            # - deliberately indistinguishable from a failed attempt
+            logging.warn(f"Rate limit: {request.remote} exceeded {settings.MAX_LOGIN_ATTEMPTS}/{settings.LOGIN_RATE_WINDOW}s, ignoring")
             ok = False
 
         else:

@@ -26,6 +26,15 @@ class Settings(metaclass=Singleton):
     # max time between showing login page, and the would-be user entering something useful (seconds)
     MAX_LOGIN_WAIT_TIME = 5*60
 
+    # login rate limiting: max login attempts from one IP per window,
+    # then attempts are ignored until the window resets
+    MAX_LOGIN_ATTEMPTS = 5
+    LOGIN_RATE_WINDOW = 60            # seconds
+
+    # maximum number of remote-IPs tracked at once (memory bound);
+    # when exceeded, the least-recently-seen entry is dropped
+    MAX_TRACKED_LOGIN_IPS = 1024
+
     # bogus fixed password to get started
     MASTER_PW = 'test1234'
 
