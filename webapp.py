@@ -196,41 +196,48 @@ def accept_user_login(ses):
     ses['ws_token'] = str(b32encode(os.urandom(15)), 'ascii')
     ses.pop('captcha', None)
 
-# Bounded per-IP login attempt limiter (sliding window).
+# Per-IP, self-refilling token bucket for login attempts.
 # - keyed on remote IP, NOT the session cookie: cookies are encrypted
 #   and client-rotatable, so an attacker could otherwise churn fresh
-#   cookies to dodge any per-session limit
+#   cookies to dodge any per-session limit.  (There is no per-user
+#   identifier available before a successful login, so the source
+#   address is the only attacker-resistant key the web layer has.)
+# - self-refilling, not a ban list: a drained address recovers one
+#   attempt every LOGIN_REFILL_SECONDS, and a full burst back within
+#   (MAX-1)*REFILL seconds.  This matters when the bunker is fronted
+#   by e.g. a Tor hidden service, where several legitimate users can
+#   share a single apparent source address with an attacker: the
+#   worst an attacker can do there is *slow down* those logins for
+#   a bounded period, never lock the address out permanently.
 # - bounded dict so an attacker forging many source IPs cannot grow
 #   memory without bound (drops the least-recently-seen entry)
-_login_attempts = collections.OrderedDict()
+_login_tokens = collections.OrderedDict()
 
 def check_login_rate(request):
     # Return True if this IP may attempt login right now.
     ip = request.remote or '?'
     now = time.time()
-    window = settings.LOGIN_RATE_WINDOW
+    cap = float(settings.MAX_LOGIN_ATTEMPTS)
+    refill = float(settings.LOGIN_REFILL_SECONDS)
 
-    entry = _login_attempts.get(ip)
-    if entry is None:
-        entry = []
-        _login_attempts[ip] = entry
-    else:
-        # mark as most-recently-seen
-        _login_attempts.move_to_end(ip)
-        # drop attempts that fell out of the window
-        while entry and entry[0] < now - window:
-            entry.pop(0)
+    # refill the bucket (up to the cap) for the time since the
+    # previous request from this address
+    tok, last = _login_tokens.get(ip, (cap, now))
+    tok = min(cap, tok + (now - last) / refill)
 
-    if len(entry) >= settings.MAX_LOGIN_ATTEMPTS:
-        return False
+    allowed = tok >= 1.0
+    if allowed:
+        tok -= 1.0
 
-    entry.append(now)
+    # record it (keeps the dict LRU-ordered for the bound below)
+    _login_tokens[ip] = (tok, now)
+    _login_tokens.move_to_end(ip)
 
     # enforce the memory bound by evicting the least-recently-seen IP
-    while len(_login_attempts) > settings.MAX_TRACKED_LOGIN_IPS:
-        _login_attempts.popitem(last=False)
+    while len(_login_tokens) > settings.MAX_TRACKED_LOGIN_IPS:
+        _login_tokens.popitem(last=False)
 
-    return True
+    return allowed
 
 @routes.post('/login')
 async def login_post(request):
@@ -262,7 +269,7 @@ async def login_post(request):
         elif not check_login_rate(request):
             # too many real guesses from this IP recently; ignore it
             # - deliberately indistinguishable from a failed attempt
-            logging.warn(f"Rate limit: {request.remote} exceeded {settings.MAX_LOGIN_ATTEMPTS}/{settings.LOGIN_RATE_WINDOW}s, ignoring")
+            logging.warn(f"Rate limit: {request.remote} login attempts throttled (per-IP), ignoring")
             ok = False
 
         else:
