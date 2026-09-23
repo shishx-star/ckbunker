@@ -213,6 +213,16 @@ def accept_user_login(ses):
 #   memory without bound (drops the least-recently-seen entry)
 _login_tokens = collections.OrderedDict()
 
+# Per-source-address ledger of *reserve* attempts (the anti-starvation
+# guarantee for users behind a shared egress address).  Bounded the same
+# way as the pool: without this, an attacker could churn fresh session
+# cookies — each carrying its own reserve counter — to farm one extra
+# attempt past the drained pool every refresh.  With the sliding-window
+# cap the extra rate an attacker can add from one address is at most
+# LOGIN_RESERVE_IP_CAP attempts / LOGIN_RESERVE_WINDOW seconds, and every
+# one of them still requires a fresh server-issued captcha.
+_reserve_ledger = collections.OrderedDict()   # ip -> [timestamps]
+
 def check_login_rate(request):
     # Return True if this IP may attempt login right now.
     ip = request.remote or '?'
@@ -238,6 +248,44 @@ def check_login_rate(request):
         _login_tokens.popitem(last=False)
 
     return allowed
+
+def consume_captcha_reserve(ses, request):
+    # Spend this session's guaranteed reserve attempt, if it has one.
+    # Three independent gates, all attacker-resistant:
+    #  1. one-shot per session  -> a single session cannot grind;
+    #  2. a fresh server-issued captcha must be present (the client cannot
+    #     mint captchas, and a spent one has to be re-fetched from the
+    #     server before another attempt);
+    #  3. a per-source-address sliding-window cap -> session churning
+    #     (rotating the encrypted cookie to farm fresh reserve counters)
+    #     is bounded to LOGIN_RESERVE_IP_CAP attempts / window per IP.
+    ip = request.remote or '?'
+    now = time.time()
+
+    if int(ses.get('reserve_used', 0)) >= settings.LOGIN_CAPTCHA_RESERVE:
+        return False
+    if 'captcha' not in ses:
+        # no fresh captcha available -> nothing to gate on, deny
+        return False
+
+    # per-IP sliding-window cap on reserve consumption
+    win = settings.LOGIN_RESERVE_WINDOW
+    cap = settings.LOGIN_RESERVE_IP_CAP
+    ts = _reserve_ledger.get(ip, [])
+    ts = [t for t in ts if now - t < win]
+    if len(ts) >= cap:
+        # address has used up its window of extra attempts; deny
+        _reserve_ledger[ip] = ts
+        _reserve_ledger.move_to_end(ip)
+        return False
+    ts.append(now)
+    _reserve_ledger[ip] = ts
+    _reserve_ledger.move_to_end(ip)
+    while len(_reserve_ledger) > settings.MAX_TRACKED_LOGIN_IPS:
+        _reserve_ledger.popitem(last=False)
+
+    ses['reserve_used'] = int(ses.get('reserve_used', 0)) + 1
+    return True
 
 @routes.post('/login')
 async def login_post(request):
@@ -266,17 +314,29 @@ async def login_post(request):
             # keep same captcha; they just pressed enter
             ok = False
 
-        elif not check_login_rate(request):
-            # too many real guesses from this IP recently; ignore it
-            # - deliberately indistinguishable from a failed attempt
-            logging.warn(f"Rate limit: {request.remote} login attempts throttled (per-IP), ignoring")
-            ok = False
-
         else:
-            expect = BP.get('master_pw', settings.MASTER_PW)        # XXX scrypt(pw)
-            expect_code = ses.pop('captcha', None)
+            # Is this attempt permitted at all: either the shared per-IP
+            # pool has a token, or this session still has its captcha-gated
+            # reserve (the guarantee for a user behind a shared egress
+            # address whose pool an attacker has drained)?
+            if check_login_rate(request):
+                permitted = True
+            elif consume_captcha_reserve(ses, request):
+                # pool drained, but this session's one-shot, captcha-gated
+                # attempt is still available -> guarantee it
+                permitted = True
+            else:
+                # still denied; deliberately indistinguishable from a
+                # failed attempt
+                logging.warn(f"Rate limit: {request.remote} login attempts throttled (per-IP), ignoring")
+                ok = False
+                permitted = None
 
-            ok = (pw == expect) and (captcha == expect_code)
+            if permitted:
+                expect = BP.get('master_pw', settings.MASTER_PW)        # XXX scrypt(pw)
+                expect_code = ses.pop('captcha', None)
+
+                ok = (pw == expect) and (captcha == expect_code)
 
     if not ok:
         # fail; do nothing visible (but they will get new captcha)

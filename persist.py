@@ -36,6 +36,33 @@ class Settings(metaclass=Singleton):
     # when exceeded, the least-recently-seen entry is dropped
     MAX_TRACKED_LOGIN_IPS = 1024
 
+    # guaranteed login attempts per session (each backed by a fresh
+    # server-issued captcha), even if the shared per-IP pool is drained.
+    # This is what keeps a legitimate user logged-in-able behind a
+    # shared egress address (e.g. a Tor hidden service) where an
+    # attacker could otherwise hold the pool drained by trickling
+    # attempts at the refill rate.
+    #
+    # It does NOT reopen unlimited guessing:
+    #   - the reserve is one-shot per session (counter lives in the
+    #     encrypted server-side session), so one session cannot grind;
+    #   - a per-IP windowed cap below bounds what session churning can
+    #     add, so the attacker's total sustained rate stays
+    #     pool-rate + cap/window, never unbounded;
+    #   - every attempt still requires a fresh server-issued captcha.
+    LOGIN_CAPTCHA_RESERVE = 1
+
+    # reserve attempts allowed PER SOURCE ADDRESS within a sliding window.
+    # This is the backstop against the session-churn vector: the reserve
+    # counter itself is per-session and the cookie is client-rotatable, so
+    # without an address-level cap an attacker could open fresh sessions
+    # to farm a fresh reserve attempt each.  With the cap, the best an
+    # attacker can do is pool-rate + cap/window sustained attempts from
+    # one address, and each of those still costs a fresh captcha.
+    LOGIN_RESERVE_IP_CAP = 5
+    LOGIN_RESERVE_WINDOW = 60  # seconds; sliding window for the cap above
+
+
     # bogus fixed password to get started
     MASTER_PW = 'test1234'
 
