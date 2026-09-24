@@ -319,24 +319,16 @@ async def login_post(request):
             # pool has a token, or this session still has its captcha-gated
             # reserve (the guarantee for a user behind a shared egress
             # address whose pool an attacker has drained)?
-            if check_login_rate(request):
-                permitted = True
-            elif consume_captcha_reserve(ses, request):
-                # pool drained, but this session's one-shot, captcha-gated
-                # attempt is still available -> guarantee it
-                permitted = True
+            if check_login_rate(request) or consume_captcha_reserve(ses, request):
+                expect = BP.get('master_pw', settings.MASTER_PW)        # XXX scrypt(pw)
+                expect_code = ses.pop('captcha', None)
+
+                ok = (pw == expect) and (captcha == expect_code)
             else:
                 # still denied; deliberately indistinguishable from a
                 # failed attempt
                 logging.warn(f"Rate limit: {request.remote} login attempts throttled (per-IP), ignoring")
                 ok = False
-                permitted = None
-
-            if permitted:
-                expect = BP.get('master_pw', settings.MASTER_PW)        # XXX scrypt(pw)
-                expect_code = ses.pop('captcha', None)
-
-                ok = (pw == expect) and (captcha == expect_code)
 
     if not ok:
         # fail; do nothing visible (but they will get new captcha)
